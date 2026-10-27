@@ -1,0 +1,107 @@
+# ======================================================================
+#  Graphene kirigami, uniaxial stretch along y (armchair), AIREBO
+#  units metal: A, eV, ps.   Run:  mpirun -np 14 lmp -in in.kirigami
+# ======================================================================
+variable T        index 300.0        # temperature [K]  (4.2 for near-0 K)
+variable RATE     index 5.0e9        # engineering strain rate [1/s]
+variable EMAX     index 1.0          # final nominal strain (1.0 = 100 %)
+variable DT       index 0.001        # time step [ps] (0.0005 if H passivation)
+variable NFRAMES  index 100          # dump frames
+variable POT      index CH.airebo-mod  # modified cut-off; CH.airebo for the original
+variable SEED     index 48271
+variable GRIP     index 15.0         # grip length [A], same as the generator
+variable TSHEET   equal 3.35         # graphene thickness for stress [A]
+
+units           metal
+atom_style      atomic
+boundary        s s s
+atom_modify     map array
+read_data       graphene_kirigami.data
+
+pair_style      airebo 3.0 1 1
+pair_coeff      * * ${POT} C H
+
+neighbor        2.0 bin
+neigh_modify    delay 0 every 1 check yes
+
+# ---------------------------------------------------------------- groups
+variable ylo    equal bound(all,ymin)
+variable yhi    equal bound(all,ymax)
+variable ycut1  equal ${ylo}+${GRIP}
+variable ycut2  equal ${yhi}-${GRIP}
+region          rbot block INF INF INF ${ycut1} INF INF units box
+region          rtop block INF INF ${ycut2} INF INF INF units box
+group           bot region rbot
+group           top region rtop
+group           grips union bot top
+group           mobile subtract all grips
+
+variable W      equal bound(all,xmax)-bound(all,xmin)
+variable W0     equal ${W}
+
+# ---------------------------------------------------------------- relax
+displace_atoms  mobile random 0.0 0.0 0.05 ${SEED} units box   # break z symmetry
+fix             gfix grips setforce 0.0 0.0 0.0
+min_style       cg
+minimize        1e-10 1e-10 5000 20000
+unfix           gfix
+reset_timestep  0
+variable Lnow   equal bound(top,ymin)-bound(bot,ymax)
+variable L0     equal ${Lnow}                            # gauge length after relaxation
+print           "sheet width ${W0} A, gauge length ${L0} A"
+
+# ---------------------------------------------------------------- equilibrate at T
+timestep        ${DT}
+compute         tmob mobile temp
+velocity        mobile create ${T} ${SEED} mom yes rot yes dist gaussian temp tmob
+velocity        grips set 0.0 0.0 0.0
+fix             fbot bot setforce 0.0 0.0 0.0
+fix             ftop top setforce 0.0 0.0 0.0
+fix             ngr grips nve
+fix             nmob mobile nvt temp ${T} ${T} $(100.0*dt)
+fix_modify      nmob temp tmob
+thermo          1000
+thermo_style    custom step temp c_tmob pe press
+run             20000
+reset_timestep  0
+
+# ---------------------------------------------------------------- stretch
+# grips move apart at +/- v/2 so the strain rate is RATE over the gauge length
+variable V      equal ${RATE}*${L0}*1.0e-12               # A/ps
+variable VH     equal ${V}/2.0
+velocity        top set 0.0  ${VH} 0.0 units box
+velocity        bot set 0.0 -${VH} 0.0 units box
+# start the sheet with the matching linear velocity profile (no shock wave from the grips)
+variable yb     equal bound(bot,ymax)
+variable yt     equal bound(top,ymin)
+velocity        mobile ramp vy -${VH} ${VH} y ${yb} ${yt} sum yes units box
+
+variable NSTEP  equal round(${EMAX}/(${RATE}*${DT}*1.0e-12))
+variable NDUMP  equal 10*round(${NSTEP}/${NFRAMES}/10)
+print           "stretching: v = ${V} A/ps, ${NSTEP} steps, dump every ${NDUMP}"
+
+compute         dsp all displace/atom
+compute         pe  all pe/atom
+compute         sat all stress/atom NULL
+compute         zmax mobile reduce max z
+compute         zmin mobile reduce min z
+
+variable strain equal (bound(top,ymin)-bound(bot,ymax)-${L0})/${L0}
+variable NAVE   equal round(${NDUMP}/10)
+# force the sheet exerts on each grip (fix setforce stores it before zeroing), eV/A -> nN
+variable Fy     equal 0.5*(f_fbot[2]-f_ftop[2])*1.602176634
+variable sig    equal v_Fy/(${W0}*${TSHEET})*1.0e2       # nN/A^2 -> GPa (x100)
+variable zamp   equal c_zmax-c_zmin
+
+# time-average force/stress over each output interval (10 samples), MD force is noisy
+fix             avg all ave/time 10 ${NAVE} ${NDUMP} v_Fy v_sig
+variable Fa     equal f_avg[1]
+variable Sa     equal f_avg[2]
+thermo_style    custom step v_strain v_Fa v_Sa c_tmob pe v_zamp
+thermo          ${NDUMP}
+fix             out all print ${NDUMP} "${strain} ${Fa} ${Sa} ${zamp} $(c_tmob:%.2f)" &
+                file stress_strain.txt screen no title "# strain  force_nN(avg)  stress_GPa(avg)  z_amplitude_A  T_K"
+dump            d1 all custom ${NDUMP} dump.kirigami id type x y z c_dsp[3] c_pe c_sat[2]
+dump_modify     d1 sort id
+run             ${NSTEP}
+write_data      final.data
