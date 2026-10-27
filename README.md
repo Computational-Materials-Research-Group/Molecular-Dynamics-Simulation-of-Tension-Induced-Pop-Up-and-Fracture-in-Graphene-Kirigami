@@ -1,0 +1,1 @@
+# Molecular-Dynamics-Simulation-of-Tension-Induced-Pop-Up-and-Fracture-in-Graphene-Kirigami
